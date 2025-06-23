@@ -24,6 +24,7 @@ import os
 import numpy as np
 import copy
 import random
+import cv2
 from safetensors.torch import load_file
 
 from .gs_utils import GaussiansManager
@@ -467,21 +468,51 @@ class GSOptimizer(nn.Module):
             cur_guidance_scale_points = (self.guidance_scale-1.0) * (1.0 - step_ratio) ** 2 + 1.0
             #cur_guidance_scale_points = self.guidance_scale
 
+            # Check if we need to save guidance images for this iteration  
+            should_save_guidance = (n % 500==0 and n!=0) or n == self.total_iterations - 1 or n==self.triplane_optim_iter
+            
+            if should_save_guidance:
+                # Get guidance images along with losses from the actual training pipeline call
+                loss_latent_sds, loss_image_sds, loss_embedding_lora, guidance_images = \
+                    self.pipe(
+                        ref_image=rendered_image_init,
+                        render_image=rendered_image_optim,
+                        mask_image=drag_mask,
+                        handle_points_pixel_list=handle_points_pixel_list,
+                        target_points_pixel_list=target_points_pixel_list,
+                        time_step=t,
+                        guidance_scale_points=cur_guidance_scale_points,
+                        prompt=[""] * batch_size,
+                        height=self.image_height,
+                        width=self.image_width,
+                        num_train_timesteps=self.num_train_timesteps,
+                        return_guidance_images=True,
+                    )
+                # Save the actual guidance images used in this training step immediately
+                self.save_actual_guidance_images(n, guidance_images, camera_list, camera_idx_list, handle_points, target_points)
+            else:
+                loss_latent_sds, loss_image_sds, loss_embedding_lora = \
+                    self.pipe(
+                        ref_image=rendered_image_init,
+                        render_image=rendered_image_optim,
+                        mask_image=drag_mask,
+                        handle_points_pixel_list=handle_points_pixel_list,
+                        target_points_pixel_list=target_points_pixel_list,
+                        time_step=t,
+                        guidance_scale_points=cur_guidance_scale_points,
+                        prompt=[""] * batch_size,
+                        height=self.image_height,
+                        width=self.image_width,
+                        num_train_timesteps=self.num_train_timesteps,
+                    )
+            if n % 500 == 0 and n > 0:  # 每500次迭代重置一次
+                print(f"Resetting embeddings at iteration {n}")
+                torch.cuda.empty_cache()
+                self.pipe.prepare_embeddings(gaussians, colmap_cameras,
+                                            handle_points, target_points,
+                                            height=self.image_height,
+                                            width=self.image_width)
 
-            loss_latent_sds, loss_image_sds, loss_embedding_lora = \
-                self.pipe(
-                    ref_image=rendered_image_init,
-                    render_image=rendered_image_optim,
-                    mask_image=drag_mask,
-                    handle_points_pixel_list=handle_points_pixel_list,
-                    target_points_pixel_list=target_points_pixel_list,
-                    time_step=t,
-                    guidance_scale_points=cur_guidance_scale_points,
-                    prompt=[""] * batch_size,
-                    height=self.image_height,
-                    width=self.image_width,
-                    num_train_timesteps=self.num_train_timesteps,
-                )
             loss_reg = F.l1_loss(delta_xyz[gaussians_optim.get_knnmask()], torch.zeros_like(delta_xyz[gaussians_optim.get_knnmask()]), reduction="mean")            
             loss = loss_latent_sds * self.lambda_latent_sds + loss_image_sds * self.lambda_image_sds + loss_embedding_lora + loss_reg * self.lambda_reg
 
@@ -513,7 +544,7 @@ class GSOptimizer(nn.Module):
                     gaussians_optim.densify_and_prune(max_grad=10,extent=camera_extent,opacity_threshold=0.01)
             
             with torch.no_grad():
-                if (n % 500==0 and n!=0) or n == self.total_iterations - 1 or n==self.triplane_optim_iter:
+                if should_save_guidance:
                     xyz, features, opacity, scales, rotations = gaussians_optim()
                     xyz_normalized = gaussians_optim.normalize_xyz(xyz.detach())
                     # delta_xyz = self.predict_delta_xyz(xyz_normalized,~gaussians_optim.get_othermask())
@@ -630,6 +661,24 @@ class GSOptimizer(nn.Module):
             create_video_from_two_folders(f"{self.output_dir}/init", f"{self.output_dir}/optim_{self.total_iterations-1}", f"{self.output_dir}/compare.mp4")
             export_ply_for_gaussians(f"{self.output_dir}/result", gaussians)
 
+    def save_actual_guidance_images(self, iteration, guidance_images, camera_list, camera_idx_list, handle_points, target_points):
+        """
+        Save the actual guidance images that were used in the current training step
+        This ensures we capture the exact guidance images from the training pipeline call
+        """
+        # Create output directory for guidance images
+        guidance_dir = f"{self.output_dir}/Drag_SDS_{iteration}"
+        if not os.path.exists(guidance_dir):
+            os.makedirs(guidance_dir)
+        
+        # Save the actual guidance images from the training step
+        for i, (cam_idx, guidance_img) in enumerate(zip(camera_idx_list, guidance_images)):
+            cam = camera_list[i]
+            img = (guidance_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy())
+            img = (img.clip(min=0, max=1) * 255.0).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(f"{guidance_dir}/cam_{cam_idx+1}_{cam.image_name}_guidance.png", img)
+
     def train_drag_webui(self,webui,update_view_interval = 10):
         gaussians = webui.gaussian
         colmap_cameras = webui.train_colmap_cameras
@@ -731,21 +780,43 @@ class GSOptimizer(nn.Module):
             cur_guidance_scale_points = (self.guidance_scale-1.0) * (1.0 - step_ratio) ** 2 + 1.0
             #cur_guidance_scale_points = self.guidance_scale
 
+            #新增: 判斷此 step 是否需要保存 guidance 影像
+            should_save_guidance = (n % 500 == 0 and n != 0) or n == self.total_iterations - 1 or n == self.triplane_optim_iter
 
-            loss_latent_sds, loss_image_sds, loss_embedding_lora = \
-                self.pipe(
-                    ref_image=rendered_image_init,
-                    render_image=rendered_image_optim,
-                    mask_image=drag_mask,
-                    handle_points_pixel_list=handle_points_pixel_list,
-                    target_points_pixel_list=target_points_pixel_list,
-                    time_step=t,
-                    guidance_scale_points=cur_guidance_scale_points,
-                    prompt=[""] * batch_size,
-                    height=self.image_height,
-                    width=self.image_width,
-                    num_train_timesteps=self.num_train_timesteps,
-                )
+            if should_save_guidance:
+                loss_latent_sds, loss_image_sds, loss_embedding_lora, guidance_images = \
+                    self.pipe(
+                        ref_image=rendered_image_init,
+                        render_image=rendered_image_optim,
+                        mask_image=drag_mask,
+                        handle_points_pixel_list=handle_points_pixel_list,
+                        target_points_pixel_list=target_points_pixel_list,
+                        time_step=t,
+                        guidance_scale_points=cur_guidance_scale_points,
+                        prompt=[""] * batch_size,
+                        height=self.image_height,
+                        width=self.image_width,
+                        num_train_timesteps=self.num_train_timesteps,
+                        return_guidance_images=True,
+                    )
+                # 保存實際使用的 guidance 影像
+                self.save_actual_guidance_images(n, guidance_images, camera_list, camera_idx_list, handle_points, target_points)
+            else:
+                loss_latent_sds, loss_image_sds, loss_embedding_lora = \
+                    self.pipe(
+                        ref_image=rendered_image_init,
+                        render_image=rendered_image_optim,
+                        mask_image=drag_mask,
+                        handle_points_pixel_list=handle_points_pixel_list,
+                        target_points_pixel_list=target_points_pixel_list,
+                        time_step=t,
+                        guidance_scale_points=cur_guidance_scale_points,
+                        prompt=[""] * batch_size,
+                        height=self.image_height,
+                        width=self.image_width,
+                        num_train_timesteps=self.num_train_timesteps,
+                    )
+
             loss_reg = F.l1_loss(delta_xyz[gaussians_optim.get_knnmask()], torch.zeros_like(delta_xyz[gaussians_optim.get_knnmask()]), reduction="mean")            
             loss = loss_latent_sds * self.lambda_latent_sds + loss_image_sds * self.lambda_image_sds + loss_embedding_lora + loss_reg * self.lambda_reg
 
@@ -831,8 +902,8 @@ class GSOptimizer(nn.Module):
             export_ply_for_gaussians(f"{self.output_dir}/result", gaussians)
     
     def train_drag_2d(self, gaussians, colmap_cameras, edit_mask, handle_points, target_points):
-        #batch_size = self.batch_size
-        batch_size = 8
+        # batch_size = self.batch_size
+        batch_size = 6
         gaussians_init = copy.deepcopy(gaussians)
 
         xyz, features, opacity, scales, rotations = gaussians_init
@@ -967,6 +1038,14 @@ class GSOptimizer(nn.Module):
                             if not os.path.exists(f"{self.output_dir}/cam_{cam_idx}/"):
                                 os.makedirs(f"{self.output_dir}/cam_{cam_idx}/")
                             cv2.imwrite(f"{self.output_dir}/cam_{cam_idx}/optim_{n}.png",img)
+
+                if n % 500 == 0 and n > 0:  # 每500次迭代重置一次
+                    print(f"Resetting embeddings at iteration {n}")
+                    torch.cuda.empty_cache()
+                    self.pipe.prepare_embeddings(gaussians, colmap_cameras,
+                                                 handle_points, target_points,
+                                                 height=self.image_height,
+                                                 width=self.image_width)
 
     def train_drag_2d_denoise(self, gaussians, colmap_cameras, edit_mask, handle_points, target_points):
         #batch_size = self.batch_size
@@ -1109,7 +1188,7 @@ class GSOptimizer(nn.Module):
                 if not os.path.exists(f"{self.output_dir}/"):
                     os.makedirs(f"{self.output_dir}/")
                 cv2.imwrite(f"{self.output_dir}/cam_{camera_idx_list[-1]+1}.png",img)
-                #cv2.imwrite(f"{self.output_dir}/cam_{camera_idx_list[-1]+1}_750.png",image_750)
-                #cv2.imwrite(f"{self.output_dir}/cam_{camera_idx_list[-1]+1}_750_pred_x0.png",img_750_pred_x0)
+                # cv2.imwrite(f"{self.output_dir}/cam_{camera_idx_list[-1]+1}_750.png",image_750)
+                # cv2.imwrite(f"{self.output_dir}/cam_{camera_idx_list[-1]+1}_750_pred_x0.png",img_750_pred_x0)
 
 

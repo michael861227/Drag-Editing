@@ -173,7 +173,7 @@ if __name__ == "__main__":
         cv2.imwrite(f"{input_info_dir}/cam{i+1}_init_img_and_mask.png", init_img_and_mask)
 
     gsoptimizer.train_drag(gaussians,train_colmap_cameras,cameras_extent,edit_mask,handle_points,target_points)
-
+    # gsoptimizer.train_drag_2d(gaussians,train_colmap_cameras,edit_mask,handle_points,target_points)
     #export_ply_for_gaussians(os.path.join(args.out_dir, 'ply', f'{filename}{extra_filename}'), result['gaussians'])
 
     

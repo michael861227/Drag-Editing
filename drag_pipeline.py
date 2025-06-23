@@ -528,7 +528,8 @@ class DragPipeline(StableDiffusionPipeline):
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        skip_cfg_appearance_encoder: bool = False
+        skip_cfg_appearance_encoder: bool = False,
+        return_guidance_images: bool = False
     ):
 
         assert self.fusion_blocks in ["midup", "full", "up"]
@@ -788,7 +789,10 @@ class DragPipeline(StableDiffusionPipeline):
         loss_latent_sds = (F.mse_loss(latents, latents_pred, reduction="none").sum([1, 2, 3]) * w * alpha / sigma).sum() / batch_size
         loss_image_sds = (F.mse_loss((render_image/2 + 0.5).to(images_pred.dtype), images_pred, reduction="none").sum([1, 2, 3]) * w * alpha / sigma).sum() / batch_size
 
-        return loss_latent_sds, loss_image_sds, loss_embedding
+        if return_guidance_images:
+            return loss_latent_sds, loss_image_sds, loss_embedding, images_pred
+        else:
+            return loss_latent_sds, loss_image_sds, loss_embedding
 
 
     def compute_sdspp_loss_2d(
