@@ -14,7 +14,8 @@ from modules.scene.camera_scene import CamScene
 from torchvision.utils import save_image
 import shutil
 from utils import seed_everything
-
+from rich.console import Console
+        
 import argparse
 from omegaconf import OmegaConf
 import json
@@ -34,6 +35,9 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=int, default=0)
     
     parser.add_argument("--from_director3d", action='store_true', default=False)
+    
+    # 新增多階段參數
+    parser.add_argument("--num_stages", type=int, default=1, help="Number of stages to divide the drag operation")
 
     args, extras = parser.parse_known_args()
     args.out_dir = os.path.join(args.base_dir, args.output_dir)
@@ -41,6 +45,7 @@ if __name__ == "__main__":
     print(args)
 
     opt = OmegaConf.load(args.config)
+    CONSOLE = Console()
     #if input from the command line
     if args.gs_source is not None:
         opt['scene']['gs_source'] = args.gs_source
@@ -80,100 +85,181 @@ if __name__ == "__main__":
         cameras_extent = scene.cameras_extent
         colmap_cameras = scene.cameras
 
-    edit_mask = torch.load(opt['scene']['mask_dir']).cuda()
-    gsoptimizer = GSOptimizer(**opt['gsoptimizer']['args'],
-                              image_height=colmap_cameras[0].image_height//colmap_cameras[0].render_res_factor,
-                              image_width=colmap_cameras[0].image_width//colmap_cameras[0].render_res_factor,
-                              train_args=args,
-                              ).to(device)
+    # 載入原始edit_mask和gaussian
+    original_edit_mask = torch.load(opt['scene']['mask_dir']).cuda()
+    original_gaussians = load_ply(opt['scene']['gs_source'])
     
-    gaussians = load_ply(opt['scene']['gs_source'])
-    xyz, features, opacity, scales, rotations = gaussians
-    gaussians_mask = (xyz[edit_mask],features[edit_mask],opacity[edit_mask],scales[edit_mask],rotations[edit_mask])
-
     handle_points = opt['scene']['handle_points']
     target_points = opt['scene']['target_points']
 
-    #delete invaild camera pose
-    train_colmap_cameras = []
-    for i,cam in enumerate(colmap_cameras):
-        #rendered_image, rendered_depth, rendered_mask = refiner.renderer.render(*gaussians, cam, scaling_modifier=1.0, bg_color=None)
-        rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam],gaussians, scaling_modifier=1.0, bg_color=None)
+    # 初始化階段性拖曳的起始點和最終目標點
+    original_handle_points = handle_points
+    final_target_points = target_points
+    original_handle_points_tensor = torch.tensor(original_handle_points, device=device)
+    final_target_points_tensor = torch.tensor(final_target_points, device=device)
+    
+    # 多階段拖曳
+    for stage in range(1, args.num_stages + 1):
+        print(f"\n=== Starting Stage {stage}/{args.num_stages} ===")
+        
+        # 設定當前階段的輸出目錄
+        stage_output_dir = os.path.join(args.out_dir, f'stage{stage}')
+        os.makedirs(stage_output_dir, exist_ok=True)
+        
+        # 載入當前階段的gaussian和計算當前階段的handle points
+        if stage == 1:
+            # 第一階段使用原始gaussian和原始handle points
+            current_gaussians = original_gaussians
+            current_edit_mask = original_edit_mask
+            current_handle_points = original_handle_points
+        else:
+            # 後續階段載入上一階段的結果
+            prev_stage_dir = os.path.join(args.out_dir, f'stage{stage-1}')
+            current_gaussians = load_ply(os.path.join(prev_stage_dir, 'result.ply'))
+            
+            # 根據上一階段的masks_lens_group重建edit_mask
+            masks_info_path = os.path.join(prev_stage_dir, 'masks_info.json')
+            if os.path.exists(masks_info_path):
+                with open(masks_info_path, 'r') as f:
+                    masks_info = json.load(f)
+                masks_lens_group = masks_info['masks_lens_group']
+                
+                # 重建edit_mask：前masks_lens_group[0]個點是被編輯的點
+                xyz, _, _, _, _ = current_gaussians
+                current_edit_mask = torch.zeros(xyz.shape[0], dtype=torch.bool, device=device)
+                current_edit_mask[:masks_lens_group[0]] = True
+                
+                # 當前階段的handle points是上一階段的target points
+                current_handle_points = masks_info['target_points']
+            else:
+                # 如果沒有masks_info，使用原始mask（這種情況不應該發生）
+                CONSOLE.log(f"Warning: masks_info.json not found for stage {stage-1}, using original mask", style="red")
+                current_edit_mask = original_edit_mask
+                current_handle_points = original_handle_points
+        
+        # 計算當前階段的目標點
+        stage_ratio = stage / args.num_stages
+        current_target_points = original_handle_points_tensor + stage_ratio * (final_target_points_tensor - original_handle_points_tensor)
+        current_target_points = current_target_points.tolist()
+        
+        CONSOLE.log(f"Stage {stage} - Handle: {current_handle_points} | Origin: {original_handle_points}", style="yellow")
+        CONSOLE.log(f"Stage {stage} - Target: {current_target_points} | Final: {final_target_points}", style="cyan")
+        # 創建GSOptimizer
+        gsoptimizer = GSOptimizer(**opt['gsoptimizer']['args'],
+                                  image_height=colmap_cameras[0].image_height//colmap_cameras[0].render_res_factor,
+                                  image_width=colmap_cameras[0].image_width//colmap_cameras[0].render_res_factor,
+                                  train_args=args,
+                                  ).to(device)
+        
+        # 設定輸出目錄到當前階段
+        gsoptimizer.output_dir = stage_output_dir
+        
+        # 準備gaussian mask
+        xyz, features, opacity, scales, rotations = current_gaussians
+        gaussians_mask = (xyz[current_edit_mask],features[current_edit_mask],opacity[current_edit_mask],scales[current_edit_mask],rotations[current_edit_mask])
 
-        assert len(handle_points) == len(target_points)
-        vaild_flag = True
-        for j in range(len(handle_points)):
-            h_pixel,h_depth = cam.world_to_pixel(handle_points[j])
-            g_pixel,g_depth = cam.world_to_pixel(target_points[j])
-            if h_depth is None or g_depth is None: 
-                # or h_depth > rendered_depth[0,0,int(h_pixel[1]),int(h_pixel[0])] + 1 or \
-                # g_depth > rendered_depth[0,0,int(g_pixel[1]),int(g_pixel[0])] + 1:
+        #delete invaild camera pose
+        train_colmap_cameras = []
+        for i,cam in enumerate(colmap_cameras):
+            rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam],current_gaussians, scaling_modifier=1.0, bg_color=None)
+
+            assert len(current_handle_points) == len(current_target_points)
+            vaild_flag = True
+            for j in range(len(current_handle_points)):
+                h_pixel,h_depth = cam.world_to_pixel(current_handle_points[j])
+                g_pixel,g_depth = cam.world_to_pixel(current_target_points[j])
+                if h_depth is None or g_depth is None: 
+                    vaild_flag = False
+            
+            rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam],current_gaussians, scaling_modifier=1.0, bg_color=None)
+            rendered_image_mask, rendered_depth_mask, _ = gsoptimizer.renderer([cam],gaussians_mask, scaling_modifier=1.0, bg_color=None)
+            mask_image = torch.ones_like(rendered_depth_mask)
+            mask_image[rendered_depth_mask==cam.zfar] = 0
+            mask_image[rendered_depth<rendered_depth_mask - opt['gsoptimizer']['args']['mask_depth_treshold']] = 0
+            if (mask_image==1).sum() < 50:
                 vaild_flag = False
+
+            if vaild_flag:
+                train_colmap_cameras.append(cam)
+
+        #valid camera number must > 10
+        assert len(train_colmap_cameras) > 10
+
+        #output init image and point for current stage
+        for i,cam in enumerate(train_colmap_cameras):
+            rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam],current_gaussians, scaling_modifier=1.0, bg_color=None)
+            
+            import cv2
+            img = (rendered_image/2 + 0.5).squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+            img = (img.clip(min = 0, max = 1)*255.0).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            assert len(current_handle_points) == len(current_target_points)
+            for j in range(len(current_handle_points)):
+                h_pixel,_ = cam.world_to_pixel(current_handle_points[j])
+                g_pixel,_ = cam.world_to_pixel(current_target_points[j])
+                cv2.circle(img, (int(h_pixel[0]),int(h_pixel[1])), 8, (255, 0, 0), -1)
+                cv2.circle(img, (int(g_pixel[0]),int(g_pixel[1])), 8, (0, 0, 255), -1)
+                cv2.arrowedLine(img, (int(h_pixel[0]),int(h_pixel[1])), 
+                                     (int(g_pixel[0]),int(g_pixel[1])), (255, 255, 255), 2, tipLength=0.5)
+            init_dir = os.path.join(stage_output_dir,"init")
+            if not os.path.exists(init_dir):
+                os.makedirs(init_dir)
+            cv2.imwrite(f"{init_dir}/cam{i+1}_{cam.image_name}.png",img)
+
+            rendered_image_mask, rendered_depth_mask, _ = gsoptimizer.renderer([cam],gaussians_mask, scaling_modifier=1.0, bg_color=None)
+
+            mask_image = torch.ones_like(rendered_depth_mask)
+            mask_image[rendered_depth_mask==cam.zfar] = 0
+            mask_image[rendered_depth<rendered_depth_mask - opt['gsoptimizer']['args']['mask_depth_treshold']] = 0
+            mask_image = mask_image.squeeze(0).permute(1, 2, 0).repeat(1,1,3).detach().cpu().numpy()
+            mask_image = (mask_image.clip(min = 0, max = 1)*255.0).astype(np.uint8)
+            mask_image = cv2.cvtColor(mask_image, cv2.COLOR_RGB2BGR)
+
+            mask_dilate_size, mask_dilate_iter = opt['gsoptimizer']['args']['mask_dilate_size'], opt['gsoptimizer']['args']['mask_dilate_iter']
+            mask_image_dilate = cv2.dilate(mask_image,np.ones((mask_dilate_size,mask_dilate_size),np.int8),iterations=mask_dilate_iter)
+
+            image_with_mask = ((0.3 * mask_image_dilate + img).clip(min = 0, max = 255) - mask_image).clip(min = 0, max = 255).astype(np.uint8)
+            input_info_dir = os.path.join(stage_output_dir,"input_info")
+            if not os.path.exists(input_info_dir):
+                os.makedirs(input_info_dir)
+            init_img_and_mask= cv2.hconcat([img, mask_image, mask_image_dilate, image_with_mask])
+            cv2.imwrite(f"{input_info_dir}/cam{i+1}_init_img_and_mask.png", init_img_and_mask)
+
+        # 執行當前階段的拖曳訓練
+        result_gaussians, masks_lens_group = gsoptimizer.train_drag(current_gaussians,train_colmap_cameras,cameras_extent,current_edit_mask,current_handle_points,current_target_points)
         
-        rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam],gaussians, scaling_modifier=1.0, bg_color=None)
-        rendered_image_mask, rendered_depth_mask, _ = gsoptimizer.renderer([cam],gaussians_mask, scaling_modifier=1.0, bg_color=None)
-        mask_image = torch.ones_like(rendered_depth_mask)
-        mask_image[rendered_depth_mask==cam.zfar] = 0
-        mask_image[rendered_depth<rendered_depth_mask - opt['gsoptimizer']['args']['mask_depth_treshold']] = 0
-        if (mask_image==1).sum() < 50:
-            vaild_flag = False
-
-        if vaild_flag:
-            train_colmap_cameras.append(cam)
-
-    #valid camera number must > 10
-    assert len(colmap_cameras) > 10
-
-    #output init image and point
-    for i,cam in enumerate(train_colmap_cameras):
-        #rendered_image, rendered_depth, rendered_mask = refiner.renderer.render(*gaussians, cam, scaling_modifier=1.0, bg_color=None)
-        rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam],gaussians, scaling_modifier=1.0, bg_color=None)
+        # 保存當前階段的masks_lens_group信息
+        # 將tensor轉換為python基本類型以便JSON序列化
+        masks_lens_group_serializable = []
+        for item in masks_lens_group:
+            if isinstance(item, torch.Tensor):
+                masks_lens_group_serializable.append(item.item())
+            else:
+                masks_lens_group_serializable.append(int(item))
         
-        import cv2
-        img = (rendered_image/2 + 0.5).squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
-        img = (img.clip(min = 0, max = 1)*255.0).astype(np.uint8)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        assert len(handle_points) == len(target_points)
-        for j in range(len(handle_points)):
-            h_pixel,_ = cam.world_to_pixel(handle_points[j])
-            g_pixel,_ = cam.world_to_pixel(target_points[j])
-            cv2.circle(img, (int(h_pixel[0]),int(h_pixel[1])), 8, (255, 0, 0), -1)
-            cv2.circle(img, (int(g_pixel[0]),int(g_pixel[1])), 8, (0, 0, 255), -1)
-            cv2.arrowedLine(img, (int(h_pixel[0]),int(h_pixel[1])), 
-                                 (int(g_pixel[0]),int(g_pixel[1])), (255, 255, 255), 2, tipLength=0.5)
-            # color = (0,0,255) if j == 0 else ((0,255,0) if j == 1 else (255,0,0))
-            # cv2.arrowedLine(img, (int(h_pixel[0]),int(h_pixel[1])), 
-            #                     (int(g_pixel[0]),int(g_pixel[1])), color)
-        init_dir = os.path.join(args.out_dir,"init")
-        if not os.path.exists(init_dir):
-            os.makedirs(init_dir)
-        cv2.imwrite(f"{init_dir}/cam{i+1}_{cam.image_name}.png",img)
+        # 將OmegaConf ListConfig轉換為普通Python list
+        def convert_to_serializable(obj):
+            """將OmegaConf或其他特殊對象轉換為JSON可序列化的格式"""
+            if hasattr(obj, 'tolist'):  # numpy array
+                return obj.tolist()
+            elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):  # list-like objects
+                return [convert_to_serializable(item) for item in obj]
+            elif hasattr(obj, 'item'):  # tensor-like objects
+                return obj.item()
+            else:
+                return obj
+        
+        masks_info = {
+            'masks_lens_group': masks_lens_group_serializable,
+            'stage': stage,
+            'handle_points': convert_to_serializable(current_handle_points),
+            'target_points': convert_to_serializable(current_target_points)
+        }
+        with open(os.path.join(stage_output_dir, 'masks_info.json'), 'w') as f:
+            json.dump(masks_info, f, indent=2)
+        
+        print(f"Stage {stage} completed. Results saved to {stage_output_dir}")
 
-        rendered_image_mask, rendered_depth_mask, _ = gsoptimizer.renderer([cam],gaussians_mask, scaling_modifier=1.0, bg_color=None)
-
-        mask_image = torch.ones_like(rendered_depth_mask)
-        mask_image[rendered_depth_mask==cam.zfar] = 0
-        mask_image[rendered_depth<rendered_depth_mask - opt['gsoptimizer']['args']['mask_depth_treshold']] = 0
-        mask_image = mask_image.squeeze(0).permute(1, 2, 0).repeat(1,1,3).detach().cpu().numpy()
-        mask_image = (mask_image.clip(min = 0, max = 1)*255.0).astype(np.uint8)
-        mask_image = cv2.cvtColor(mask_image, cv2.COLOR_RGB2BGR)
-
-        #cv2.imwrite(f"{init_dir}/cam{i+1}_mask.png",mask_image)
-
-        mask_dilate_size, mask_dilate_iter = opt['gsoptimizer']['args']['mask_dilate_size'], opt['gsoptimizer']['args']['mask_dilate_iter']
-        mask_image_dilate = cv2.dilate(mask_image,np.ones((mask_dilate_size,mask_dilate_size),np.int8),iterations=mask_dilate_iter)
-        #cv2.imwrite(f"{init_dir}/cam{i+1}_mask_dilate.png",mask_image_dilate)
-
-        image_with_mask = ((0.3 * mask_image_dilate + img).clip(min = 0, max = 255) - mask_image).clip(min = 0, max = 255).astype(np.uint8)
-        #cv2.imwrite(f"{init_dir}/cam{i+1}_image_with_mask.png",image_with_mask)
-        input_info_dir = os.path.join(args.out_dir,"input_info")
-        if not os.path.exists(input_info_dir):
-            os.makedirs(input_info_dir)
-        init_img_and_mask= cv2.hconcat([img, mask_image, mask_image_dilate, image_with_mask])
-        cv2.imwrite(f"{input_info_dir}/cam{i+1}_init_img_and_mask.png", init_img_and_mask)
-
-    gsoptimizer.train_drag(gaussians,train_colmap_cameras,cameras_extent,edit_mask,handle_points,target_points)
-    # gsoptimizer.train_drag_2d(gaussians,train_colmap_cameras,edit_mask,handle_points,target_points)
-    #export_ply_for_gaussians(os.path.join(args.out_dir, 'ply', f'{filename}{extra_filename}'), result['gaussians'])
+    print(f"\n=== All {args.num_stages} stages completed ===")
 
     

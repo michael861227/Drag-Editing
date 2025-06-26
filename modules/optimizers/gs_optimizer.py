@@ -660,6 +660,9 @@ class GSOptimizer(nn.Module):
             # export compare video
             create_video_from_two_folders(f"{self.output_dir}/init", f"{self.output_dir}/optim_{self.total_iterations-1}", f"{self.output_dir}/compare.mp4")
             export_ply_for_gaussians(f"{self.output_dir}/result", gaussians)
+            
+            # 返回結果gaussian和masks_lens_group信息，用於多階段拖曳
+            return gaussians, gaussians_optim.masks_lens_group
 
     def save_actual_guidance_images(self, iteration, guidance_images, camera_list, camera_idx_list, handle_points, target_points):
         """

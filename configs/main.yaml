@@ -15,8 +15,7 @@ gsoptimizer:
     min_step_percent: 0.02
     max_step_percent: 0.98
     num_densifications: 9
-    #? total_iterations: 1500
-    total_iterations: 2500
+    total_iterations: 1500
     triplane_optim_iter: -1
     triplane_optim_step_percent: 0.7 #only use when triplane_optim_iter = -1
     triplane_lr_down_scale: 0.1
@@ -41,7 +40,8 @@ gsoptimizer:
     only_optimize_3d_mask: True
 
     mask_depth_treshold: 1
-    mask_dilate_size: 30
+    # mask_dilate_size: 30
+    mask_dilate_size: 60
     mask_dilate_iter: 2
 
     use_knn: True
