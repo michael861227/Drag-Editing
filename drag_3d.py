@@ -139,8 +139,8 @@ if __name__ == "__main__":
         
         # 計算當前階段的目標點
         stage_ratio = stage / args.num_stages
-        current_target_points = original_handle_points_tensor + stage_ratio * (final_target_points_tensor - original_handle_points_tensor)
-        current_target_points = current_target_points.tolist()
+        current_target_points_tensor = original_handle_points_tensor + stage_ratio * (final_target_points_tensor - original_handle_points_tensor)
+        current_target_points = current_target_points_tensor.tolist()
         
         CONSOLE.log(f"Stage {stage} - Handle: {current_handle_points} | Origin: {original_handle_points}", style="yellow")
         CONSOLE.log(f"Stage {stage} - Target: {current_target_points} | Final: {final_target_points}", style="cyan")
@@ -226,7 +226,23 @@ if __name__ == "__main__":
             cv2.imwrite(f"{input_info_dir}/cam{i+1}_init_img_and_mask.png", init_img_and_mask)
 
         # 執行當前階段的拖曳訓練
-        result_gaussians, masks_lens_group = gsoptimizer.train_drag(current_gaussians,train_colmap_cameras,cameras_extent,current_edit_mask,current_handle_points,current_target_points)
+        result_gaussians, masks_lens_group, training_params = gsoptimizer.train_drag(current_gaussians,train_colmap_cameras,cameras_extent,current_edit_mask,current_handle_points,current_target_points)
+        
+        #* Generate guidance images after training completes
+        if stage_output_dir is not None:
+            torch.cuda.empty_cache()  # Clear training memory first
+            
+            # Prepare gaussians_init and gs_init_mask for guidance generation
+            xyz, features, opacity, scales, rotations = current_gaussians
+            gaussians_init = current_gaussians
+            gs_init_mask = (xyz[current_edit_mask],features[current_edit_mask],opacity[current_edit_mask],scales[current_edit_mask],rotations[current_edit_mask])
+            
+            # Pass the exact training parameters to ensure consistency
+            gsoptimizer.generate_final_guidance_images(
+                result_gaussians, gaussians_init, gs_init_mask, 
+                train_colmap_cameras, current_handle_points, current_target_points, stage_output_dir, training_params
+            )
+            
         
         # 保存當前階段的masks_lens_group信息
         # 將tensor轉換為python基本類型以便JSON序列化

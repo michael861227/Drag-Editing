@@ -407,6 +407,10 @@ class GSOptimizer(nn.Module):
                 rendered_image_optim, rendered_depth, rendered_mask = self.renderer([cam],gs_optim, scaling_modifier=1.0, bg_color=None,save_radii_viewspace_points=False,down_sample_res=False)
                 import cv2
 
+        # Initialize variables to store final iteration parameters
+        final_t = None
+        final_guidance_scale = None
+        final_step_ratio = None
 
         for n in tqdm(range(self.total_iterations),desc="trainning drag"):
             xyz, features, opacity, scales, rotations = gaussians_optim()
@@ -467,6 +471,12 @@ class GSOptimizer(nn.Module):
             
             cur_guidance_scale_points = (self.guidance_scale-1.0) * (1.0 - step_ratio) ** 2 + 1.0
             #cur_guidance_scale_points = self.guidance_scale
+            
+            # Store final iteration parameters for guidance generation consistency
+            if n == self.total_iterations - 1:
+                final_t = t.clone()
+                final_guidance_scale = cur_guidance_scale_points
+                final_step_ratio = step_ratio
 
             # Check if we need to save guidance images for this iteration  
             should_save_guidance = (n % 500==0 and n!=0) or n == self.total_iterations - 1 or n==self.triplane_optim_iter
@@ -661,8 +671,17 @@ class GSOptimizer(nn.Module):
             create_video_from_two_folders(f"{self.output_dir}/init", f"{self.output_dir}/optim_{self.total_iterations-1}", f"{self.output_dir}/compare.mp4")
             export_ply_for_gaussians(f"{self.output_dir}/result", gaussians)
             
-            # 返回結果gaussian和masks_lens_group信息，用於多階段拖曳
-            return gaussians, gaussians_optim.masks_lens_group
+            # 返回結果gaussian、masks_lens_group信息和最終iteration參數，用於多階段拖曳和guidance生成一致性
+            training_params = {
+                'final_t': final_t,
+                'final_guidance_scale': final_guidance_scale,
+                'final_step_ratio': final_step_ratio,
+                'min_step': self.min_step,
+                'max_step': self.max_step,
+                'base_guidance_scale': self.guidance_scale,
+                'num_train_timesteps': self.num_train_timesteps
+            }
+            return gaussians, gaussians_optim.masks_lens_group, training_params
 
     def save_actual_guidance_images(self, iteration, guidance_images, camera_list, camera_idx_list, handle_points, target_points):
         """
@@ -903,6 +922,112 @@ class GSOptimizer(nn.Module):
             # export compare video
             create_video_from_two_folders(f"{self.output_dir}/init", f"{self.output_dir}/optim_{self.total_iterations-1}", f"{self.output_dir}/compare.mp4")
             export_ply_for_gaussians(f"{self.output_dir}/result", gaussians)
+    
+    def generate_final_guidance_images(self, final_gaussians, gaussians_init, gs_init_mask, colmap_cameras, handle_points, target_points, output_dir, training_params=None):
+        """
+        Generate guidance images for ALL views after training completes.
+        This ensures memory separation between training and guidance generation.
+        Uses EXACT same parameters as the final training iteration.
+        
+        Args:
+            final_gaussians: Final optimized gaussian parameters
+            gaussians_init: Initial gaussian parameters
+            gs_init_mask: Initial gaussian mask
+            colmap_cameras: List of camera objects
+            handle_points: List of handle points 
+            target_points: List of target points
+            output_dir: Output directory for guidance images
+            training_params: Dictionary containing final training iteration parameters (optional)
+        """
+        print("Generating guidance images for ALL views after training completion...")
+        
+        # Clear any remaining training memory
+        torch.cuda.empty_cache()
+        
+        if training_params is not None:
+            # Use EXACT parameters from the final training iteration
+            final_t = training_params['final_t']
+            final_guidance_scale = training_params['final_guidance_scale']
+            final_step_ratio = training_params['final_step_ratio']
+            final_iteration = self.total_iterations - 1
+            
+            print(f"Using parameters from final training iteration {final_iteration}:")
+            print(f"  - step_ratio: {final_step_ratio:.4f} (from training)")
+            print(f"  - timestep: {final_t.item()} (from training)")
+            print(f"  - guidance_scale: {final_guidance_scale:.4f} (from training)")
+        
+    
+        with torch.no_grad():
+            # Generate data for ALL camera views
+            all_rendered_image_init_list = []
+            all_rendered_image_optim_list = []
+            all_drag_mask_list = []
+            all_handle_points_pixel_list = []
+            all_target_points_pixel_list = []
+            all_camera_indices = []
+            
+            # Process ALL camera views
+            for cam_idx, camera in enumerate(colmap_cameras):
+                # Render images for this view
+                rendered_image_init_single, rendered_depth_init_single, _ = self.renderer([camera], gaussians_init)
+                rendered_image_optim_single, rendered_depth_optim_single, _ = self.renderer([camera], final_gaussians)
+                
+                # Generate mask for this view  
+                _, rendered_depth_mask_single, _ = self.renderer([camera], gs_init_mask, save_radii_viewspace_points=False)
+                mask_image_single = torch.ones_like(rendered_depth_mask_single)
+                mask_image_single[rendered_depth_mask_single == camera.zfar] = 0
+                mask_image_single[rendered_depth_init_single < rendered_depth_mask_single - self.mask_depth_treshold] = 0
+                mask_image_single = mask_image_single.squeeze().cpu().numpy().astype(np.uint8)
+                
+                # Dilate mask
+                drag_mask_single = Image.fromarray(cv2.dilate(mask_image_single * 255, 
+                                                             np.ones((self.mask_dilate_size, self.mask_dilate_size), np.int8), 
+                                                             iterations=self.mask_dilate_iter))
+                
+                # Calculate handle and target points for this view
+                h_pixel = []
+                g_pixel = []
+                for j in range(len(handle_points)):
+                    h_pixel_xy, _ = camera.world_to_pixel(handle_points[j])
+                    g_pixel_xy, _ = camera.world_to_pixel(target_points[j])
+                    h_pixel.append(h_pixel_xy[[1, 0]].unsqueeze(0))
+                    g_pixel.append(g_pixel_xy[[1, 0]].unsqueeze(0))
+                handle_points_pixel_single = torch.cat(h_pixel, dim=0).long()
+                target_points_pixel_single = torch.cat(g_pixel, dim=0).long()
+                
+                # Collect data for this view
+                all_rendered_image_init_list.append(rendered_image_init_single.squeeze(0))
+                all_rendered_image_optim_list.append(rendered_image_optim_single.squeeze(0))
+                all_drag_mask_list.append(drag_mask_single)
+                all_handle_points_pixel_list.append(handle_points_pixel_single)
+                all_target_points_pixel_list.append(target_points_pixel_single)
+                all_camera_indices.append(cam_idx)
+            
+            # Stack all view data
+            all_rendered_image_init = torch.stack(all_rendered_image_init_list, dim=0)
+            all_rendered_image_optim = torch.stack(all_rendered_image_optim_list, dim=0)
+            
+            print(f"Generated data for {len(all_camera_indices)} views, now generating guidance images...")
+            
+            # Generate guidance images for ALL views using EXACT same parameters as final training iteration
+            self.pipe.generate_all_view_guidance(
+                prompt=[""] * len(colmap_cameras),  # One prompt per view
+                ref_images=all_rendered_image_init,  # ALL views rendered images
+                render_images=all_rendered_image_optim,  # ALL views rendered images
+                mask_images=all_drag_mask_list,  # ALL views masks
+                handle_points_pixel_list=all_handle_points_pixel_list,  # ALL views handle points
+                target_points_pixel_list=all_target_points_pixel_list,  # ALL views target points
+                camera_indices=all_camera_indices,  # Camera indices for naming
+                iteration=final_iteration,  # Use final iteration number
+                output_dir=output_dir,
+                time_step=final_t,  # EXACT same timestep as final training iteration
+                guidance_scale_points=final_guidance_scale,  # EXACT same guidance scale as final training iteration
+                height=self.image_height,
+                width=self.image_width,
+                num_train_timesteps=training_params['num_train_timesteps'] if training_params else self.num_train_timesteps,  # Use same num_train_timesteps as training
+            )
+            
+            print("All view guidance images generation completed successfully!")
     
     def train_drag_2d(self, gaussians, colmap_cameras, edit_mask, handle_points, target_points):
         # batch_size = self.batch_size

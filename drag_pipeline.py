@@ -16,6 +16,8 @@
 # limitations under the License. 
 # *************************************************************************
 
+import os
+import cv2
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -1357,3 +1359,161 @@ class DragPipeline(StableDiffusionPipeline):
 
         #print(f"{(time_2 - time_1)/(time_3 - time_1):.4f}")
         return latents_noisy,latents_noisy_750,latents_750_pred_x0
+    
+    @torch.no_grad()
+    def generate_all_view_guidance(
+        self,
+        prompt: Union[str, List[str]],
+        ref_images: torch.FloatTensor,  # [num_views, C, H, W]
+        render_images: torch.FloatTensor,  # [num_views, C, H, W] 
+        mask_images: List[PIL.Image.Image],  # List of mask images for each view
+        handle_points_pixel_list: List,  # Handle points for each view
+        target_points_pixel_list: List,  # Target points for each view
+        camera_indices: List[int],  # Camera indices for file naming
+        iteration: int,
+        output_dir: str,
+        time_step: int = 500,
+        guidance_scale_points: float = 3.0,
+        height: int = 512,
+        width: int = 512,
+        num_train_timesteps: int = 1000,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: int = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        skip_cfg_appearance_encoder: bool = False,
+    ):
+        """
+        Generate guidance images for all views and save them to disk.
+        
+        Args:
+            prompt: Text prompt
+            ref_images: Reference images for all views [num_views, C, H, W]
+            render_images: Rendered images for all views [num_views, C, H, W]
+            mask_images: List of mask images for each view
+            handle_points_pixel_list: Handle points for each view
+            target_points_pixel_list: Target points for each view
+            camera_indices: Camera indices for file naming  
+            iteration: Current iteration number
+            output_dir: Base output directory
+            time_step: Denoising timestep to use
+            guidance_scale_points: Guidance scale for points
+            height: Image height
+            width: Image width
+            num_train_timesteps: Number of training timesteps
+            negative_prompt: Negative prompt
+            num_images_per_prompt: Number of images per prompt
+            generator: Random generator
+            cross_attention_kwargs: Cross attention kwargs
+            skip_cfg_appearance_encoder: Whether to skip CFG for appearance encoder
+        """
+        
+        # Create output directory
+        guidance_dir = os.path.join(output_dir, f"Guidance_{iteration}")
+        os.makedirs(guidance_dir, exist_ok=True)
+        
+        num_views = ref_images.shape[0]
+        device = self._execution_device
+        
+        print(f"Generating guidance images for {num_views} views at iteration {iteration}...")
+        print(f"Using EXACT same parameters: timestep={time_step}, guidance_scale={guidance_scale_points:.4f}")
+        print(f"Each view will use DIFFERENT noise to match training behavior (generator=None)")
+        
+        # Note: We don't use a fixed generator for all views
+        # During training, generator=None means each view gets different noise
+        # We replicate this behavior by using different seeds per view
+        
+        # Process each view individually to avoid memory issues
+        for view_idx in range(num_views):
+            cam_idx = camera_indices[view_idx]
+            
+            # Generate DIFFERENT noise for each view to match training behavior
+            # During training, each view in the batch gets different noise (generator=None)
+            # So we should replicate this behavior: different noise per view
+            view_generator = torch.Generator(device=device)
+            view_generator.manual_seed(iteration * 42 + time_step.item() + view_idx)  # Different seed per view
+            
+            # Extract data for current view
+            ref_image = ref_images[view_idx:view_idx+1]  # [1, C, H, W]
+            render_image = render_images[view_idx:view_idx+1]  # [1, C, H, W]
+            mask_image = [mask_images[view_idx]]  # List with single mask
+            handle_points_pixel = [handle_points_pixel_list[view_idx]]
+            target_points_pixel = [target_points_pixel_list[view_idx]]
+            
+            # Call the existing pipeline with return_guidance_images=True
+            # Use single prompt for single view to avoid batch size mismatch
+            single_prompt = prompt[0] if isinstance(prompt, list) else prompt
+            loss_latent_sds, loss_image_sds, loss_embedding, images_pred = self.__call__(
+                prompt=single_prompt,
+                ref_image=ref_image,
+                render_image=render_image,
+                mask_image=mask_image,
+                handle_points_pixel_list=handle_points_pixel,
+                target_points_pixel_list=target_points_pixel,
+                time_step=time_step,
+                guidance_scale_points=guidance_scale_points,
+                height=height,
+                width=width,
+                num_train_timesteps=num_train_timesteps,
+                negative_prompt=negative_prompt,
+                num_images_per_prompt=num_images_per_prompt,
+                generator=view_generator,  # Use different generator per view to match training
+                cross_attention_kwargs=cross_attention_kwargs,
+                skip_cfg_appearance_encoder=skip_cfg_appearance_encoder,
+                return_guidance_images=True
+            )
+            
+            # Convert guidance image to numpy
+            guidance_image = images_pred[0]  # Take first image from batch
+            guidance_image_np = guidance_image.detach().cpu().numpy()
+            guidance_image_np = (guidance_image_np * 255).astype(np.uint8)
+            guidance_image_np = np.transpose(guidance_image_np, (1, 2, 0))  # CHW -> HWC
+            
+            # Convert render image to numpy
+            render_image_np = render_images[view_idx].detach().cpu().numpy()
+            render_image_np = ((render_image_np + 1) / 2 * 255).astype(np.uint8)  # Convert from [-1,1] to [0,255]
+            render_image_np = np.transpose(render_image_np, (1, 2, 0))  # CHW -> HWC
+            
+            # Create side-by-side comparison image (render left, guidance right)
+            comparison_image = np.concatenate([render_image_np, guidance_image_np], axis=1)  # Horizontal concatenation
+            
+            # Add extra space at the bottom for text labels
+            label_height = 40
+            labeled_image = np.ones((comparison_image.shape[0] + label_height, comparison_image.shape[1], 3), dtype=np.uint8) * 255
+            labeled_image[:comparison_image.shape[0], :, :] = comparison_image
+            
+            # Add text labels
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            color = (0, 0, 0)  # Black text
+            thickness = 2
+            
+            # Calculate text positions
+            render_text = "Render"
+            guidance_text = "Guidance"
+            
+            # Get text sizes for centering
+            (render_text_width, render_text_height), _ = cv2.getTextSize(render_text, font, font_scale, thickness)
+            (guidance_text_width, guidance_text_height), _ = cv2.getTextSize(guidance_text, font, font_scale, thickness)
+            
+            # Calculate center positions
+            render_center_x = width // 2 - render_text_width // 2
+            guidance_center_x = width + width // 2 - guidance_text_width // 2
+            text_y = comparison_image.shape[0] + (label_height + render_text_height) // 2
+            
+            # Add text labels
+            cv2.putText(labeled_image, render_text, (render_center_x, text_y), font, font_scale, color, thickness)
+            cv2.putText(labeled_image, guidance_text, (guidance_center_x, text_y), font, font_scale, color, thickness)
+            
+            # Convert back to PIL Image
+            comparison_pil = PIL.Image.fromarray(labeled_image)
+            
+            # Save the comparison image with camera index in filename
+            comparison_path = os.path.join(guidance_dir, f"comparison_cam_{cam_idx:03d}_view_{view_idx:04d}.png")
+            comparison_pil.save(comparison_path)
+            
+            # print(f"Saved comparison image for camera {cam_idx} (view {view_idx}): {comparison_path}")
+        
+        print(f"All guidance images saved to: {guidance_dir}")
+        print(f"Generated {num_views} comparison images with consistent noise (seed: {iteration * 42 + time_step})")
+        return guidance_dir
