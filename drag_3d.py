@@ -15,7 +15,8 @@ from torchvision.utils import save_image
 import shutil
 from utils import seed_everything
 from rich.console import Console
-        
+import cv2
+
 import argparse
 from omegaconf import OmegaConf
 import json
@@ -38,6 +39,7 @@ if __name__ == "__main__":
     
     # 新增多階段參數
     parser.add_argument("--num_stages", type=int, default=1, help="Number of stages to divide the drag operation")
+    parser.add_argument("--lora_only_first_stage", action='store_true', default=False, help="Only train LoRA in first stage, reuse weights in subsequent stages")
 
     args, extras = parser.parse_known_args()
     args.out_dir = os.path.join(args.base_dir, args.output_dir)
@@ -145,10 +147,13 @@ if __name__ == "__main__":
         CONSOLE.log(f"Stage {stage} - Handle: {current_handle_points} | Origin: {original_handle_points}", style="yellow")
         CONSOLE.log(f"Stage {stage} - Target: {current_target_points} | Final: {final_target_points}", style="cyan")
         # 創建GSOptimizer
+        # Skip LoRA training if lora_only_first_stage is True and this is not the first stage
+        skip_lora_training = args.lora_only_first_stage and stage > 1
         gsoptimizer = GSOptimizer(**opt['gsoptimizer']['args'],
                                   image_height=colmap_cameras[0].image_height//colmap_cameras[0].render_res_factor,
                                   image_width=colmap_cameras[0].image_width//colmap_cameras[0].render_res_factor,
                                   train_args=args,
+                                  skip_lora_training=skip_lora_training,
                                   ).to(device)
         
         # 設定輸出目錄到當前階段
@@ -225,8 +230,113 @@ if __name__ == "__main__":
             init_img_and_mask= cv2.hconcat([img, mask_image, mask_image_dilate, image_with_mask])
             cv2.imwrite(f"{input_info_dir}/cam{i+1}_init_img_and_mask.png", init_img_and_mask)
 
+        # 如果需要在後續階段使用第一階段的LoRA權重，先進行特殊準備
+        if args.lora_only_first_stage and stage > 1:
+            # 為後續階段載入第一階段的LoRA權重
+            lora_weights_path = os.path.join(args.out_dir, 'lora_weights')
+            gsoptimizer.prepare_embeddings_with_lora_control(
+                current_gaussians, train_colmap_cameras, 
+                current_handle_points, current_target_points,
+                gsoptimizer.image_height, gsoptimizer.image_width,
+                lora_weights_path=lora_weights_path
+            )
+        
         # 執行當前階段的拖曳訓練
         result_gaussians, masks_lens_group, training_params = gsoptimizer.train_drag(current_gaussians,train_colmap_cameras,cameras_extent,current_edit_mask,current_handle_points,current_target_points)
+        
+        # 如果這是第一階段且啟用了lora_only_first_stage，保存LoRA權重並執行推理
+        if args.lora_only_first_stage and stage == 1:
+            lora_weights_path = os.path.join(args.out_dir, 'lora_weights')
+            gsoptimizer.save_lora_weights(lora_weights_path)
+            CONSOLE.log(f"LoRA weights saved to {lora_weights_path} after stage 1", style="green")
+            
+            # 執行LoRA推理，為每個訓練視角生成一張輸出圖片
+            lora_denoise_dir = os.path.join(args.out_dir, 'lora_denoise')
+            os.makedirs(lora_denoise_dir, exist_ok=True)
+            CONSOLE.log(f"Starting LoRA inference for {len(train_colmap_cameras)} training views...", style="blue")
+            
+            # 為每個訓練視角生成推理圖片
+            for i, cam in enumerate(train_colmap_cameras):
+                # 渲染當前視角的圖像
+                rendered_image, rendered_depth, rendered_mask = gsoptimizer.renderer([cam], current_gaussians, scaling_modifier=1.0, bg_color=None)
+                
+                # 準備mask圖像
+                rendered_image_mask, rendered_depth_mask, _ = gsoptimizer.renderer([cam], gaussians_mask, scaling_modifier=1.0, bg_color=None)
+                mask_image = torch.ones_like(rendered_depth_mask)
+                mask_image[rendered_depth_mask==cam.zfar] = 0
+                mask_image[rendered_depth<rendered_depth_mask - opt['gsoptimizer']['args']['mask_depth_treshold']] = 0
+                
+                # 創建dilated mask
+                mask_dilate_size, mask_dilate_iter = opt['gsoptimizer']['args']['mask_dilate_size'], opt['gsoptimizer']['args']['mask_dilate_iter']
+                mask_np = mask_image.squeeze(0).permute(1, 2, 0).repeat(1,1,3).detach().cpu().numpy()
+                mask_np = (mask_np.clip(min = 0, max = 1)*255.0).astype(np.uint8)
+                mask_np = cv2.cvtColor(mask_np, cv2.COLOR_RGB2BGR)
+                mask_image_dilate = cv2.dilate(mask_np, np.ones((mask_dilate_size, mask_dilate_size), np.int8), iterations=mask_dilate_iter)
+                
+                # 轉換為PIL圖像格式
+                mask_pil = Image.fromarray(cv2.cvtColor(mask_image_dilate, cv2.COLOR_BGR2RGB))
+                
+                # 準備handle和target points的像素坐標
+                handle_points_pixel = []
+                target_points_pixel = []
+                for j in range(len(current_handle_points)):
+                    h_pixel, _ = cam.world_to_pixel(current_handle_points[j])
+                    t_pixel, _ = cam.world_to_pixel(current_target_points[j])
+                    handle_points_pixel.append([int(h_pixel[0]), int(h_pixel[1])])
+                    target_points_pixel.append([int(t_pixel[0]), int(t_pixel[1])])
+                
+                # 使用LoRA進行推理 - 確保完整的dtype一致性
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+                    # 編碼渲染圖像到latent空間
+                    rendered_image_norm = rendered_image * 0.5 + 0.5  # Convert from [-1,1] to [0,1]
+                    latents = gsoptimizer.pipe.vae.encode(rendered_image_norm.to(dtype=gsoptimizer.pipe.vae.dtype)).latent_dist.sample()
+                    latents = latents * gsoptimizer.pipe.vae.config.scaling_factor
+                    
+                    # 使用與訓練最終iteration相同的時間步進行推理
+                    t = torch.tensor([training_params['final_t']], dtype=torch.long, device=gsoptimizer.device)
+                    
+                    # 添加噪聲
+                    noise = torch.randn_like(latents)
+                    latents_noisy = gsoptimizer.pipe.scheduler.add_noise(latents, noise, t)
+                    
+                    # 確保所有輸入都是float32並且整個unet_lora模型也是float32
+                    latents_noisy = latents_noisy.float()
+                    embeddings = gsoptimizer.pipe.learnable_embeddings.repeat(1, 1, 1).float()
+                    
+                    # 確保unet_lora模型所有參數都是float32
+                    original_unet_dtype = next(gsoptimizer.pipe.unet_lora.parameters()).dtype
+                    if original_unet_dtype != torch.float32:
+                        gsoptimizer.pipe.unet_lora = gsoptimizer.pipe.unet_lora.float()
+                    
+                    # 使用LoRA模型進行去噪
+                    noise_pred = gsoptimizer.pipe.unet_lora(
+                        latents_noisy,
+                        t,
+                        encoder_hidden_states=embeddings,
+                    ).sample
+                    
+                    # 恢復原始dtype（如果有改變的話）
+                    if original_unet_dtype != torch.float32:
+                        gsoptimizer.pipe.unet_lora = gsoptimizer.pipe.unet_lora.to(original_unet_dtype)
+                    
+                    # 計算去噪後的latents
+                    alpha_prod_t = gsoptimizer.pipe.scheduler.alphas_cumprod[t]
+                    beta_prod_t = 1 - alpha_prod_t
+                    pred_original_sample = (latents_noisy - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+                    
+                    # 解碼回圖像空間
+                    result_image = gsoptimizer.pipe.vae.decode(pred_original_sample.to(dtype=gsoptimizer.pipe.vae.dtype)).sample
+                
+                # 轉換到[0,1]範圍並保存
+                result_image = (result_image * 0.5 + 0.5).clamp(0, 1)
+                result_image_pil = gsoptimizer.pipe.image_processor.postprocess(result_image, output_type='pil')[0]
+                
+                # 保存推理結果
+                output_path = os.path.join(lora_denoise_dir, f'cam_{i+1}_{cam.image_name}_lora_denoise.png')
+                result_image_pil.save(output_path)
+                        
+             
+            CONSOLE.log(f"LoRA inference completed. Results saved to {lora_denoise_dir}", style="green")
         
         #* Generate guidance images after training completes
         if stage_output_dir is not None:
@@ -275,6 +385,8 @@ if __name__ == "__main__":
             json.dump(masks_info, f, indent=2)
         
         print(f"Stage {stage} completed. Results saved to {stage_output_dir}")
+        print(f"  - Final masks for next stage saved to: {stage_output_dir}/mask/")
+        print(f"    Files follow format: cam_{{i+1}}_{{frame_name}}.png")
 
     print(f"\n=== All {args.num_stages} stages completed ===")
 

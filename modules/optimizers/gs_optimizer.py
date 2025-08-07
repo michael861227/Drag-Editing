@@ -72,6 +72,7 @@ class GSOptimizer(nn.Module):
             image_height=512,
             image_width=512,
             train_args=None,
+            skip_lora_training=False,
         ):
         super().__init__()
         self.device = "cuda"
@@ -196,6 +197,26 @@ class GSOptimizer(nn.Module):
         self.image_width = int(image_width)
 
         self.mask_depth_treshold = mask_depth_treshold
+        
+        # LoRA training control
+        self.skip_lora_training = skip_lora_training
+
+    def save_lora_weights(self, save_path):
+        """Save LoRA weights using DragPipeline's save method."""
+        self.pipe.save_lora_weights(save_path)
+    
+    def load_lora_weights(self, load_path):
+        """Load LoRA weights using DragPipeline's load method."""
+        self.pipe.load_lora_weights(load_path)
+    
+    def prepare_embeddings_with_lora_control(self, gaussians, colmap_cameras, handle_points, target_points, height, width, lora_weights_path=None):
+        """Prepare embeddings with optional LoRA weight loading."""
+        # Always prepare embeddings first
+        self.pipe.prepare_embeddings(gaussians, colmap_cameras, handle_points, target_points, height, width)
+        
+        # If we should load existing LoRA weights, do so
+        if lora_weights_path is not None and self.skip_lora_training:
+            self.load_lora_weights(lora_weights_path)
 
     # create net for grid feature
     def create_grid_net(self):
@@ -540,8 +561,10 @@ class GSOptimizer(nn.Module):
                 for param_group in self.grid_net_optimizer.param_groups:
                     param_group['lr'] = param_group['lr'] * self.triplane_lr_down_scale
             
-            self.pipe.unet_emb_lora_optimizer.step()
-            self.pipe.unet_emb_lora_optimizer.zero_grad()
+            # Skip LoRA training if using pre-trained weights
+            if not self.skip_lora_training:
+                self.pipe.unet_emb_lora_optimizer.step()
+                self.pipe.unet_emb_lora_optimizer.zero_grad()
             #lr_scheduler_triplane.step()
 
             if n > self.triplane_optim_iter and step_ratio > 0.25 and step_ratio <= 0.8:
@@ -671,6 +694,9 @@ class GSOptimizer(nn.Module):
             create_video_from_two_folders(f"{self.output_dir}/init", f"{self.output_dir}/optim_{self.total_iterations-1}", f"{self.output_dir}/compare.mp4")
             export_ply_for_gaussians(f"{self.output_dir}/result", gaussians)
             
+            # Save final masks for next stage use
+            self._save_final_masks_for_next_stage(gaussians, gaussians_optim.masks_lens_group, colmap_cameras)
+            
             # 返回結果gaussian、masks_lens_group信息和最終iteration參數，用於多階段拖曳和guidance生成一致性
             training_params = {
                 'final_t': final_t,
@@ -682,6 +708,52 @@ class GSOptimizer(nn.Module):
                 'num_train_timesteps': self.num_train_timesteps
             }
             return gaussians, gaussians_optim.masks_lens_group, training_params
+
+    def _save_final_masks_for_next_stage(self, final_gaussians, masks_lens_group, colmap_cameras):
+        """Save final masks following the optim_{k} format for next stage use"""
+        import cv2
+        import os
+        
+        # Create mask directory following optim pattern
+        mask_dir = os.path.join(self.output_dir, "mask")
+        os.makedirs(mask_dir, exist_ok=True)
+        
+        # Create gs_init_mask from final gaussians using masks_lens_group
+        # masks_lens_group[0] contains the number of edited gaussian points
+        xyz, features, opacity, scales, rotations = final_gaussians
+        num_edited_points = masks_lens_group[0]
+        gs_init_mask = (xyz[:num_edited_points], features[:num_edited_points], opacity[:num_edited_points], scales[:num_edited_points], rotations[:num_edited_points])
+        
+        with torch.no_grad():
+            for i, camera in enumerate(colmap_cameras):
+                # Render mask for this camera
+                _, rendered_depth_final, _ = self.renderer([camera], final_gaussians, scaling_modifier=1.0, bg_color=None)
+                _, rendered_depth_mask, _ = self.renderer([camera], gs_init_mask, save_radii_viewspace_points=False)
+                
+                # Generate original mask image (no dilation)
+                mask_image = torch.ones_like(rendered_depth_mask)
+                mask_image[rendered_depth_mask == camera.zfar] = 0
+                mask_image[rendered_depth_final < rendered_depth_mask - self.mask_depth_treshold] = 0
+                
+                # Convert to numpy without dilation - save original rendered mask
+                mask_np = mask_image.squeeze().cpu().numpy().astype(np.uint8)
+                mask_original = mask_np * 255  # Convert to 0-255 range
+                
+                # Ensure the mask is 2D (grayscale) for OpenCV
+                while mask_original.ndim > 2:
+                    mask_original = mask_original.squeeze()
+                    
+                # Ensure it's exactly 2D
+                if mask_original.ndim == 1:
+                    # If somehow it became 1D, try to reshape based on image dimensions
+                    mask_original = mask_original.reshape(self.image_height, self.image_width)
+                elif mask_original.ndim == 0:
+                    # If it's a scalar, create a proper mask
+                    mask_original = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
+                
+                # Save with optim format naming: cam_{i+1}_{camera.image_name}.png
+                mask_filename = f"cam_{i+1}_{camera.image_name}.png"
+                cv2.imwrite(os.path.join(mask_dir, mask_filename), mask_original)
 
     def save_actual_guidance_images(self, iteration, guidance_images, camera_list, camera_idx_list, handle_points, target_points):
         """
@@ -856,8 +928,10 @@ class GSOptimizer(nn.Module):
                 for param_group in self.grid_net_optimizer.param_groups:
                     param_group['lr'] = param_group['lr'] * self.triplane_lr_down_scale
             
-            self.pipe.unet_emb_lora_optimizer.step()
-            self.pipe.unet_emb_lora_optimizer.zero_grad()
+            # Skip LoRA training if using pre-trained weights
+            if not self.skip_lora_training:
+                self.pipe.unet_emb_lora_optimizer.step()
+                self.pipe.unet_emb_lora_optimizer.zero_grad()
             #lr_scheduler_triplane.step()
 
             if n > self.triplane_optim_iter and step_ratio > 0.25 and step_ratio <= 0.8:

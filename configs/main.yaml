@@ -40,8 +40,7 @@ gsoptimizer:
     only_optimize_3d_mask: True
 
     mask_depth_treshold: 1
-    # mask_dilate_size: 30
-    mask_dilate_size: 60
+    mask_dilate_size: 30
     mask_dilate_iter: 2
 
     use_knn: True

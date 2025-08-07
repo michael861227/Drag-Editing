@@ -510,6 +510,43 @@ class DragPipeline(StableDiffusionPipeline):
                 {"name": "lora_layers", 'params': self.lora_layers, 'lr': 5e-4},
             ])
     
+    def save_lora_weights(self, save_path):
+        """Save LoRA weights and learnable embeddings to disk."""
+        import os
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save LoRA weights
+        lora_path = os.path.join(save_path, 'lora_weights.pth')
+        torch.save(self.unet_lora.state_dict(), lora_path)
+        
+        # Save learnable embeddings (Parameter object, save directly)
+        embeddings_path = os.path.join(save_path, 'learnable_embeddings.pth')
+        torch.save(self.learnable_embeddings, embeddings_path)
+        
+        print(f"LoRA weights saved to {save_path}")
+    
+    def load_lora_weights(self, load_path):
+        """Load LoRA weights and learnable embeddings from disk."""
+        import os
+        
+        # Load LoRA weights
+        lora_path = os.path.join(load_path, 'lora_weights.pth')
+        if os.path.exists(lora_path):
+            lora_state_dict = torch.load(lora_path, map_location=self.device)
+            self.unet_lora.load_state_dict(lora_state_dict)
+            print(f"LoRA weights loaded from {lora_path}")
+        else:
+            raise FileNotFoundError(f"LoRA weights not found at {lora_path}")
+        
+        # Load learnable embeddings (Parameter object, load data directly)
+        embeddings_path = os.path.join(load_path, 'learnable_embeddings.pth')
+        if os.path.exists(embeddings_path):
+            loaded_embeddings = torch.load(embeddings_path, map_location=self.device)
+            self.learnable_embeddings.data = loaded_embeddings.data
+            print(f"Learnable embeddings loaded from {embeddings_path}")
+        else:
+            raise FileNotFoundError(f"Learnable embeddings not found at {embeddings_path}")
+    
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
