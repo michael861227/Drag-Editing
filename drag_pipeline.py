@@ -1403,6 +1403,7 @@ class DragPipeline(StableDiffusionPipeline):
         prompt: Union[str, List[str]],
         ref_images: torch.FloatTensor,  # [num_views, C, H, W]
         render_images: torch.FloatTensor,  # [num_views, C, H, W] 
+        original_render_images: torch.FloatTensor,  # [num_views, C, H, W] - Original 3DGS renders before editing
         mask_images: List[PIL.Image.Image],  # List of mask images for each view
         handle_points_pixel_list: List,  # Handle points for each view
         target_points_pixel_list: List,  # Target points for each view
@@ -1422,11 +1423,13 @@ class DragPipeline(StableDiffusionPipeline):
     ):
         """
         Generate guidance images for all views and save them to disk.
+        Creates comparison images with three views: original render, edited render, and 2D guidance.
         
         Args:
             prompt: Text prompt
             ref_images: Reference images for all views [num_views, C, H, W]
-            render_images: Rendered images for all views [num_views, C, H, W]
+            render_images: Rendered images for all views after drag editing [num_views, C, H, W]
+            original_render_images: Original 3DGS rendered images before editing [num_views, C, H, W]
             mask_images: List of mask images for each view
             handle_points_pixel_list: Handle points for each view
             target_points_pixel_list: Target points for each view
@@ -1506,13 +1509,18 @@ class DragPipeline(StableDiffusionPipeline):
             guidance_image_np = (guidance_image_np * 255).astype(np.uint8)
             guidance_image_np = np.transpose(guidance_image_np, (1, 2, 0))  # CHW -> HWC
             
-            # Convert render image to numpy
+            # Convert original render image to numpy
+            original_render_image_np = original_render_images[view_idx].detach().cpu().numpy()
+            original_render_image_np = ((original_render_image_np + 1) / 2 * 255).astype(np.uint8)  # Convert from [-1,1] to [0,255]
+            original_render_image_np = np.transpose(original_render_image_np, (1, 2, 0))  # CHW -> HWC
+            
+            # Convert edited render image to numpy
             render_image_np = render_images[view_idx].detach().cpu().numpy()
             render_image_np = ((render_image_np + 1) / 2 * 255).astype(np.uint8)  # Convert from [-1,1] to [0,255]
             render_image_np = np.transpose(render_image_np, (1, 2, 0))  # CHW -> HWC
             
-            # Create side-by-side comparison image (render left, guidance right)
-            comparison_image = np.concatenate([render_image_np, guidance_image_np], axis=1)  # Horizontal concatenation
+            # Create side-by-side comparison image (original left, edited middle, guidance right)
+            comparison_image = np.concatenate([original_render_image_np, render_image_np, guidance_image_np], axis=1)  # Horizontal concatenation
             
             # Add extra space at the bottom for text labels
             label_height = 40
@@ -1525,21 +1533,25 @@ class DragPipeline(StableDiffusionPipeline):
             color = (0, 0, 0)  # Black text
             thickness = 2
             
-            # Calculate text positions
-            render_text = "Render"
-            guidance_text = "Guidance"
+            # Calculate text positions for three images
+            original_text = "Original Render"
+            edited_text = "Edited Render"
+            guidance_text = "2D Drag"
             
             # Get text sizes for centering
-            (render_text_width, render_text_height), _ = cv2.getTextSize(render_text, font, font_scale, thickness)
+            (original_text_width, original_text_height), _ = cv2.getTextSize(original_text, font, font_scale, thickness)
+            (edited_text_width, edited_text_height), _ = cv2.getTextSize(edited_text, font, font_scale, thickness)
             (guidance_text_width, guidance_text_height), _ = cv2.getTextSize(guidance_text, font, font_scale, thickness)
             
-            # Calculate center positions
-            render_center_x = width // 2 - render_text_width // 2
-            guidance_center_x = width + width // 2 - guidance_text_width // 2
-            text_y = comparison_image.shape[0] + (label_height + render_text_height) // 2
+            # Calculate center positions for three images
+            original_center_x = width // 2 - original_text_width // 2
+            edited_center_x = width + width // 2 - edited_text_width // 2
+            guidance_center_x = 2 * width + width // 2 - guidance_text_width // 2
+            text_y = comparison_image.shape[0] + (label_height + original_text_height) // 2
             
             # Add text labels
-            cv2.putText(labeled_image, render_text, (render_center_x, text_y), font, font_scale, color, thickness)
+            cv2.putText(labeled_image, original_text, (original_center_x, text_y), font, font_scale, color, thickness)
+            cv2.putText(labeled_image, edited_text, (edited_center_x, text_y), font, font_scale, color, thickness)
             cv2.putText(labeled_image, guidance_text, (guidance_center_x, text_y), font, font_scale, color, thickness)
             
             # Convert back to PIL Image
@@ -1552,5 +1564,5 @@ class DragPipeline(StableDiffusionPipeline):
             # print(f"Saved comparison image for camera {cam_idx} (view {view_idx}): {comparison_path}")
         
         print(f"All guidance images saved to: {guidance_dir}")
-        print(f"Generated {num_views} comparison images with consistent noise (seed: {iteration * 42 + time_step})")
+        print(f"Generated {num_views} three-way comparison images (Original Render | Edited Render | 2D Drag) with consistent noise (seed: {iteration * 42 + time_step})")
         return guidance_dir

@@ -8,7 +8,8 @@ gradio_director3d.py
 EXP*
 
 **/.vscode
-/data
+data/*
+!data/*.zip
 /mask
 /test
 /lora_tmp

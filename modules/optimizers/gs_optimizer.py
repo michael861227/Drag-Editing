@@ -1086,8 +1086,9 @@ class GSOptimizer(nn.Module):
             # Generate guidance images for ALL views using EXACT same parameters as final training iteration
             self.pipe.generate_all_view_guidance(
                 prompt=[""] * len(colmap_cameras),  # One prompt per view
-                ref_images=all_rendered_image_init,  # ALL views rendered images
-                render_images=all_rendered_image_optim,  # ALL views rendered images
+                ref_images=all_rendered_image_init,  # ALL views reference images
+                render_images=all_rendered_image_optim,  # ALL views edited rendered images
+                original_render_images=all_rendered_image_init,  # ALL views original rendered images (before editing)
                 mask_images=all_drag_mask_list,  # ALL views masks
                 handle_points_pixel_list=all_handle_points_pixel_list,  # ALL views handle points
                 target_points_pixel_list=all_target_points_pixel_list,  # ALL views target points

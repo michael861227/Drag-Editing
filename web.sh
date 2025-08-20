@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=2 python webui.py \
-    --colmap_dir ./data/kitchen/ \
-    --gs_source ./data/kitchen/point_cloud.ply \
-    --output_dir kitchen-test
+CUDA_VISIBLE_DEVICES=1 python webui.py \
+    --colmap_dir ./data/face/ \
+    --gs_source ./data/face/point_cloud.ply \
+    --output_dir drag1-manual

@@ -71,6 +71,10 @@ if __name__ == "__main__":
 
     seed_everything(0)
 
+    # Initialize Gaussian count log file for this run
+    gaussian_num_file = os.path.join(args.out_dir, 'Gaussian_num.txt')
+    open(gaussian_num_file, 'w').close() 
+
     if args.from_director3d:
         camera_npy_files = [f for f in os.listdir(opt['scene']['colmap_dir']) if f.endswith('.npy')]
         assert len(camera_npy_files) == 1
@@ -162,6 +166,10 @@ if __name__ == "__main__":
         # 準備gaussian mask
         xyz, features, opacity, scales, rotations = current_gaussians
         gaussians_mask = (xyz[current_edit_mask],features[current_edit_mask],opacity[current_edit_mask],scales[current_edit_mask],rotations[current_edit_mask])
+
+        # Count gaussians before training for current stage
+        total_before = int(xyz.shape[0])
+        masked_before = int(current_edit_mask.sum().item())
 
         #delete invaild camera pose
         train_colmap_cameras = []
@@ -299,8 +307,6 @@ if __name__ == "__main__":
                     noise = torch.randn_like(latents)
                     latents_noisy = gsoptimizer.pipe.scheduler.add_noise(latents, noise, t)
                     
-                    # 確保所有輸入都是float32並且整個unet_lora模型也是float32
-                    latents_noisy = latents_noisy.float()
                     embeddings = gsoptimizer.pipe.learnable_embeddings.repeat(1, 1, 1).float()
                     
                     # 確保unet_lora模型所有參數都是float32
@@ -383,6 +389,20 @@ if __name__ == "__main__":
         }
         with open(os.path.join(stage_output_dir, 'masks_info.json'), 'w') as f:
             json.dump(masks_info, f, indent=2)
+
+        # Count gaussians after training and append to Gaussian_num.txt
+        result_xyz, _, _, _, _ = result_gaussians
+        total_after = int(result_xyz.shape[0])
+        masked_after_value = masks_lens_group[0]
+        if isinstance(masked_after_value, torch.Tensor):
+            masked_after = int(masked_after_value.item())
+        else:
+            masked_after = int(masked_after_value)
+        with open(gaussian_num_file, 'a') as f:
+            f.write(f"Stage{stage}:\n")
+            f.write(f"Masked Gaussians before training: {masked_before} / Total Gaussians before training: {total_before}\n")
+            f.write(f"Masked Gaussians after training: {masked_after} / Total Gaussians after training: {total_after}\n")
+            
         
         print(f"Stage {stage} completed. Results saved to {stage_output_dir}")
         print(f"  - Final masks for next stage saved to: {stage_output_dir}/mask/")
