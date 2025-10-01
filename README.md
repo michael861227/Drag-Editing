@@ -1,43 +1,15 @@
-<p align="center">
-  <img width="15%" src="assets/logo1.png"/>
-</p>
-
-<p align="center">
-<!--   <h1 align="center"><img height="100" src="https://github.com/imlixinyang/director3d-page/raw/master/assets/icon.ico"></h1> -->
-  <h1 align="center"> Drag-Your-Gaussian</h1>
-  <p align="center">
-        <!-- <a href="[text](https://arxiv.org/pdf/2501.18672)"><img src='https://img.shields.io/badge/arXiv-DYG-red?logo=arxiv' alt='Paper PDF'></a> -->
-        <a href="https://arxiv.org/abs/2501.18672"><img src='https://img.shields.io/badge/arXiv-DYG-red?logo=arxiv' alt='Paper PDF'></a>
-        <a href='https://quyans.github.io/Drag-Your-Gaussian/'><img src='https://img.shields.io/badge/Project_Page-DYG-green' alt='Project Page'></a>
-  </p>
-  <p>Officially implement of the paper "Drag Your Gaussian: Effective Drag-Based Editing with Score Distillation for 3D Gaussian Splatting".</p>
-
-## 😊 TL;DR
-
-DYG allows users to drag 3D Gaussians, achieving flexible and precise 3D scene editing results.
-
-
-## 🎥 Introduction Video
-
-<!-- <p align="center">
-  <img width="100%" src="assets/teaser.gif"/>
-</p> -->
-
-https://github.com/user-attachments/assets/1e484ff9-f44c-4995-a99d-453cf0f11f95
-
-
-
-Visiting our [**Project Page**](https://quyans.github.io/Drag-Your-Gaussian/) for more result.
-
 ## 🔧 Installation
+
 - clone this repo:
+
 ```
-git clone https://github.com/Quyans/Drag-Your-Gaussian.git
-cd Drag-Your-Gaussian
-git submodule update --init --recursive 
+git clone https://github.com/michael861227/Drag-Editing.git
+cd Drag-Editing
+git submodule update --init --recursive
 ```
 
 - set up a new conda environment
+
 ```
 conda env create --file environment.yaml
 conda activate DYG
@@ -47,6 +19,7 @@ conda activate DYG
 
 Refer to [3DGS](https://github.com/graphdeco-inria/gaussian-splatting?tab=readme-ov-file#processing-your-own-scenes) for reconstruction. We recommend setting the spherical harmonic degree to 0 for the reconstruction process.
 Alternatively, you can use the [data](https://drive.google.com/drive/folders/19Jv3crbF7xMu1ouNoCH-mEH87ClykpuY?usp=sharing) we have prepared. Taking the face scene as an example, the file structure is as follows:
+
 ```
 └── data
     └── face
@@ -57,7 +30,9 @@ Alternatively, you can use the [data](https://drive.google.com/drive/folders/19J
         ├── sparse
         └── point_cloud.ply
 ```
+
 Since we use LightningDrag as the diffusion prior, you need to download the model following the instructions in [lightningdrag](https://github.com/magic-research/LightningDrag/blob/main/INSTALLATION.md#2-download-pretrained-models) and organize it according to the following structure.
+
 ```
 └── checkpoints
     ├── dreamshaper-8-inpainting
@@ -80,24 +55,43 @@ Since we use LightningDrag as the diffusion prior, you need to download the mode
 ```
 
 ## 🚋 Training
+
 Start the WebUI using the following command. For detailed usage instructions, refer to [WebUI](./assets/webui-guide/webui.md)
+
+### Launch the WebUI
+
 ```shell
 python webui.py --colmap_dir <path to colmap dir> --gs_source <path to 3DGS ply> --output_dir <save path>
-#This is a specific example.
+```
+
+### Example
+
+```shell
 python webui.py --colmap_dir ./data/face/ --gs_source ./data/face/point_cloud.ply --output_dir result
 ```
-You can train directly in the WebUI. Alternatively, after selecting the drag point and mask in the WebUI, export the corresponding data files drag_point.json and gaussian_mask.pt, and start the training using the following command, where the `--point_dir` and `--mask_dir` parameters represent the file paths.
+
+### Training without WebUI (Recommended)
+
+If you already have `gaussian_mask.pt` and `drag_points.json` saved from WebUI, you can train without WebUI by using the following command.
+
+`--num_stages`
+Specifies how many stages the entire drag editing process is divided into. Instead of applying a single large drag operation, the process is split into multiple smaller stages to achieve more stable and better results.
+
+`--lora_only_first_stage`
+If enabled, LoRA training will only occur during the first stage. Subsequent stages will reuse the pretrained LoRA from stage one instead of retraining it.
 
 ```shell
 python drag_3d.py --config configs/main.yaml \
-                  --colmap_dir ./data/face/ \
-                  --gs_source ./data/face/point_cloud.ply \
-                  --point_dir ./data/face/export_1/drag_points.json \
-                  --mask_dir ./data/face/export_1/gaussian_mask.pt \
-                  --output_dir result
+            --colmap_dir ./data/face/ \
+            --gs_source ./data/face/point_cloud.ply \
+            --point_dir ./data/face/export_1/drag_points.json \
+            --mask_dir ./data/face/export_1/gaussian_mask.pt  \
+            --output_dir result \
+            --num_stages 3 \
+            --lora_only_first_stage
 ```
 
-## Citation
+<!-- ## Citation
 
 ```
 @article{qu2025drag,
@@ -106,13 +100,16 @@ python drag_3d.py --config configs/main.yaml \
   journal={arXiv preprint arXiv:2501.18672},
   year={2025}
 }
-```
+``` -->
 
-## License
+<!-- ## License
 
 Licensed under the CC BY-NC-SA 4.0 (Attribution-NonCommercial-ShareAlike 4.0 International)
 
+The code is released for academic research use only.
 
-The code is released for academic research use only. 
+If you have any questions, please contact me via [quyans@stu.xmu.edu.cn](mailto:quyans@stu.xmu.edu.cn). -->
 
-If you have any questions, please contact me via [quyans@stu.xmu.edu.cn](mailto:quyans@stu.xmu.edu.cn). 
+## Acknowledgement
+
+The implementation is base on [Drag Your Gaussian](https://github.com/Quyans/Drag-Your-Gaussian)
